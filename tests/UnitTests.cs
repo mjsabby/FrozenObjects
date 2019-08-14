@@ -48,6 +48,81 @@ namespace Microsoft.FrozenObjects.UnitTests
         }
 
         [Fact]
+        public void BasicTestWithType()
+        {
+            var classWithTypeField = new MyClassHasATypeField();
+            classWithTypeField.Field = typeof(MyClassHasATypeField);
+
+            var tmpPath = Path.GetTempPath();
+            var basicdll = Path.Combine(tmpPath, "basicwithtype.dll");
+            var basicbin = Path.Combine(tmpPath, "basicwithtype.bin");
+
+            SerializeObject(classWithTypeField, basicbin, basicdll, "xyz", "abc", "m", new Version(1, 0, 0, 0), null);
+
+            var asm = Assembly.Load(File.ReadAllBytes(basicdll));
+            var types = asm.GetTypes();
+            foreach (var type in types)
+            {
+                if (type.FullName == "xyz.abc")
+                {
+                    foreach (var method in type.GetMethods())
+                    {
+                        if (method.Name == "m")
+                        {
+                            var obj = method.Invoke(null, new object[] { basicbin });
+                            Assert.IsType(classWithTypeField.GetType(), obj);
+                            UnloadFrozenObject(obj);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            File.Delete(basicdll);
+            File.Delete(basicbin);
+        }
+
+        [Fact]
+        public void BasicTestWithCustomMethodType()
+        {
+            var classWithMethodPtr = new ClassHoldingAMethodPointer();
+            classWithMethodPtr.MethodHandle = new SlimMethodHandle();
+
+            classWithMethodPtr.MethodHandle.FnPointer = typeof(OuterStruct).GetMethods()[0].MethodHandle.GetFunctionPointer();
+
+            var customMethodStuff = new CustomMethodSerializer(classWithMethodPtr.MethodHandle, typeof(OuterStruct).GetMethods()[0]);
+
+            var tmpPath = Path.GetTempPath();
+            var basicdll = Path.Combine(tmpPath, "basicwithmethod.dll");
+            var basicbin = Path.Combine(tmpPath, "basicwithmethod.bin");
+
+            SerializeObject(classWithMethodPtr, basicbin, basicdll, "xyz", "abc", "m", new Version(1, 0, 0, 0), customMethodStuff);
+
+            var asm = Assembly.Load(File.ReadAllBytes(basicdll));
+            var types = asm.GetTypes();
+            foreach (var type in types)
+            {
+                if (type.FullName == "xyz.abc")
+                {
+                    foreach (var method in type.GetMethods())
+                    {
+                        if (method.Name == "m")
+                        {
+                            var obj = (ClassHoldingAMethodPointer)method.Invoke(null, new object[] { basicbin });
+                            Assert.Equal(obj.MethodHandle.FnPointer, classWithMethodPtr.MethodHandle.FnPointer);
+                            Assert.IsType(classWithMethodPtr.GetType(), obj);
+                            UnloadFrozenObject(obj);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            File.Delete(basicdll);
+            File.Delete(basicbin);
+        }
+
+        [Fact]
         public void MDArrayTest()
         {
             int[,] arr = new int[1,1];

@@ -1,4 +1,6 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
+using System.Reflection;
 using Microsoft.Collections.Extensions;
 
 namespace Microsoft.FrozenObjects.UnitTests
@@ -23,6 +25,11 @@ namespace Microsoft.FrozenObjects.UnitTests
 
     public class OuterStruct
     {
+        public static void DoSomething()
+        {
+            Console.WriteLine("Called from a deserializer");
+        }
+
         public struct GenericValueTypeWithReferences<T>
         {
             public string A;
@@ -73,5 +80,45 @@ namespace Microsoft.FrozenObjects.UnitTests
     public class Circular
     {
         public Bar Foo;
+    }
+
+    public class MyClassHasATypeField
+    {
+        public Type Field;
+    }
+
+    public class ClassHoldingAMethodPointer
+    {
+        public SlimMethodHandle MethodHandle;
+    }
+
+    public class SlimMethodHandle
+    {
+        public IntPtr FnPointer;
+    }
+
+    public class CustomMethodSerializer : ICustomMethodSerialization
+    {
+        private readonly object o;
+
+        private readonly MethodInfo m;
+
+        public CustomMethodSerializer(object o, MethodInfo m)
+        {
+            this.o = o;
+            this.m = m;
+        }
+
+        public Type TypeOfMethodObject => typeof(SlimMethodHandle);
+
+        public MethodInfo GetMethodInfo(object o)
+        {
+            if (ReferenceEquals(o, o))
+            {
+                return this.m;
+            }
+
+            throw new Exception("Not found");
+        }
     }
 }

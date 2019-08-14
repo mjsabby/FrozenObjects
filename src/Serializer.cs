@@ -14,30 +14,33 @@
 
     public static class Serializer
     {
-        public static void SerializeObject(object o, string outputDataPath, string outputAssemblyFilePath, string outputNamespace, string typeName, string methodName, Version version, Type methodType = null, byte[] privateKeyOpt = null)
+        public static void SerializeObject(object o, string outputDataPath, string outputAssemblyFilePath, string outputNamespace, string typeName, string methodName, Version version, ICustomMethodSerialization customMethodSerialization = null, byte[] privateKeyOpt = null)
         {
-            Dictionary<Type, int> typeTokenMap = SerializeDataAndBuildTypeTokenMap(o, outputDataPath);
+            var methodDictTokenMap = new Dictionary<MethodInfo, int>();
+            Dictionary<Type, int> typeTokenMap = SerializeDataAndBuildTypeTokenMap(o, outputDataPath, methodDictTokenMap, customMethodSerialization);
 
-            (HashSet<Assembly> allAssemblies, HashSet<Type> allTypes) = ComputeAssemblyAndTypeClosure(typeTokenMap);
+            (HashSet<Assembly> allAssemblies, HashSet<Type> allTypes) = ComputeAssemblyAndTypeClosure(typeTokenMap, methodDictTokenMap.Keys);
 
             MetadataBuilder metadataBuilder = CreateMetadataBuilder(Path.GetFileName(outputAssemblyFilePath), Path.GetFileNameWithoutExtension(outputAssemblyFilePath), version);
             
             Dictionary<Assembly, AssemblyReferenceHandle> assemblyReferenceHandleMap = AccumulateAssemblyReferenceHandles(metadataBuilder, allAssemblies);
             Dictionary<Type, TypeReferenceHandle> uniqueTypeRefMap = AccumulateTypeReferenceHandles(metadataBuilder, assemblyReferenceHandleMap, allTypes);
+            Dictionary<MethodInfo, ValueTuple<MemberReferenceHandle, int>> memberReferenceHandleMap = AccumulateMemberReferenceHandles(metadataBuilder, uniqueTypeRefMap, methodDictTokenMap);
             Dictionary<Type, TypeSpecificationHandle> typeToTypeSpecMap = AccumulateTypeSpecificationHandles(metadataBuilder, uniqueTypeRefMap, typeTokenMap);
 
-            SerializeCompanionAssembly(metadataBuilder, outputAssemblyFilePath, outputNamespace, typeName, methodName, typeTokenMap, typeToTypeSpecMap, privateKeyOpt);
+            SerializeCompanionAssembly(metadataBuilder, outputAssemblyFilePath, outputNamespace, typeName, methodName, typeTokenMap, typeToTypeSpecMap, memberReferenceHandleMap, privateKeyOpt);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static unsafe void WriteObjectGraphToDisk(byte* stackAllocatedData, Stream stream, Dictionary<object, long> serializedObjectMap, Queue<object> objectQueue, RuntimeTypeHandleDictionary mtTokenMap, ref long lastReservedObjectEnd)
+        private static unsafe void WriteObjectGraphToDisk(byte* stackAllocatedData, Stream stream, Dictionary<object, long> serializedObjectMap, Queue<object> objectQueue, RuntimeTypeHandleDictionary mtTokenMap, ref long lastReservedObjectEnd, IntPtr runtimeTypeTypeHandleValue, Dictionary<MethodInfo, int> methodDictTokenMap, IntPtr customMethodTypeTypeHandleValue, ICustomMethodSerialization customMethodSerialization)
         {
             long nextObjectHeaderFilePointer = 0;
 
             while (objectQueue.Count != 0)
             {
                 object o = objectQueue.Dequeue();
-                ref TypeInfo typeInfo = ref mtTokenMap.GetOrAddValueRef(Type.GetTypeHandle(o));
+                var typeHandle = Type.GetTypeHandle(o);
+                ref TypeInfo typeInfo = ref mtTokenMap.GetOrAddValueRef(typeHandle);
 
                 long mtToken;
 
@@ -47,7 +50,7 @@
                 }
                 else
                 {
-                    mtToken = mtTokenMap.Count - 1;
+                    mtToken = mtTokenMap.Count;
                     typeInfo = GetObjectInfo(o, mtToken);
                 }
 
@@ -84,7 +87,15 @@
 
                     var remainingSize = objectSize - IntPtr.Size - IntPtr.Size; // because we have already written the object header and MT Token
 
-                    if (remainingSize <= int.MaxValue)
+                    if (typeHandle.Value == runtimeTypeTypeHandleValue)
+                    {
+                        WriteTypeObject(stream);
+                    }
+                    else if (typeHandle.Value == customMethodTypeTypeHandleValue)
+                    {
+                        WriteMethodTypeObject(stream, customMethodSerialization, o, methodDictTokenMap, mtTokenMap);
+                    }
+                    else if (remainingSize <= int.MaxValue)
                     {
                         stream.Write(new ReadOnlySpan<byte>(data, (int)remainingSize));
                     }
@@ -104,6 +115,35 @@
                     stream.Seek(nextObjectHeaderFilePointer, SeekOrigin.Begin);
                 }
             }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static unsafe void WriteTypeObject(Stream stream)
+        {
+            ReadOnlySpan<byte> data = new byte[] { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+
+            if (IntPtr.Size == 8)
+            {
+                stream.Write(data);
+            }
+            else
+            {
+                stream.Write(data.Slice(0, IntPtr.Size * 3));
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static unsafe void WriteMethodTypeObject(Stream stream, ICustomMethodSerialization customMethodSerialization, object o, Dictionary<MethodInfo, int> methodDictTokenMap, RuntimeTypeHandleDictionary mtTokenMap)
+        {
+            var methodInfo = customMethodSerialization.GetMethodInfo(o);
+            if (!methodDictTokenMap.TryGetValue(methodInfo, out var token))
+            {
+                token = methodDictTokenMap.Count;
+                methodDictTokenMap.Add(methodInfo, token);
+            }
+
+            var longToken = (long)token;
+            stream.Write(new Span<byte>(&longToken, IntPtr.Size));
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -138,11 +178,29 @@
         /// </remarks>
         /// <param name="root">object to serialize</param>
         /// <param name="outputDataPath">file path for the serialized object graph</param>
-        private static unsafe Dictionary<Type, int> SerializeDataAndBuildTypeTokenMap(object root, string outputDataPath)
+        /// <param name="methodType">method type</param>
+        private static unsafe Dictionary<Type, int> SerializeDataAndBuildTypeTokenMap(object root, string outputDataPath, Dictionary<MethodInfo, int> methodDictTokenMap, ICustomMethodSerialization customMethodSerialization)
         {
             var serializedObjectMap = new Dictionary<object, long>();
             var mtTokenMap = new RuntimeTypeHandleDictionary(100);
             var objectQueue = new Queue<object>();
+
+            var runtimeType = typeof(Type).GetType();
+            var runtimeTypeTypeHandleValue = runtimeType.TypeHandle;
+            {
+                ref var typeInfo = ref mtTokenMap.GetOrAddValueRef(runtimeTypeTypeHandleValue); // System.RuntimeType is always 0
+                typeInfo = GetObjectInfo(runtimeType, 0);
+            }
+
+            IntPtr methodTypeTypeHandleValue = IntPtr.Zero;
+            if (customMethodSerialization != null && customMethodSerialization.TypeOfMethodObject != null)
+            {
+                methodTypeTypeHandleValue = customMethodSerialization.TypeOfMethodObject.TypeHandle.Value;
+                {
+                    ref var typeInfo = ref mtTokenMap.GetOrAddValueRef(customMethodSerialization.TypeOfMethodObject.TypeHandle);
+                    typeInfo = new TypeInfo { MTToken = 1 }; // This does not populate GCDesc, so this type better not have any references.
+                }
+            }
 
             objectQueue.Enqueue(root);
 
@@ -153,7 +211,7 @@
 
             using (var stream = new FileStream(outputDataPath, FileMode.Create, FileAccess.Write))
             {
-                WriteObjectGraphToDisk(stackAllocatedData, stream, serializedObjectMap, objectQueue, mtTokenMap, ref lastReservedObjectEnd);
+                WriteObjectGraphToDisk(stackAllocatedData, stream, serializedObjectMap, objectQueue, mtTokenMap, ref lastReservedObjectEnd, runtimeTypeTypeHandleValue.Value, methodDictTokenMap, methodTypeTypeHandleValue, customMethodSerialization);
             }
 
             var typeTokenMap = new Dictionary<Type, int>(mtTokenMap.Count);
@@ -183,13 +241,26 @@
         /// Next, please read <seealso cref="AccumulateAssemblyReferenceHandles"/>.
         /// </remarks>
         /// <param name="typeTokenMap">The unique set of types that were in the input object graph</param>
-        private static Tuple<HashSet<Assembly>, HashSet<Type>> ComputeAssemblyAndTypeClosure(Dictionary<Type, int> typeTokenMap)
+        /// <param name="methodInfos">The method infos we may need to encode</param>
+        private static Tuple<HashSet<Assembly>, HashSet<Type>> ComputeAssemblyAndTypeClosure(Dictionary<Type, int> typeTokenMap, IEnumerable<MethodInfo> methodInfos)
         {
             var typeQueue = new Queue<Type>();
 
             foreach (var entry in typeTokenMap)
             {
                 typeQueue.Enqueue(entry.Key);
+            }
+
+            foreach (var methodInfo in methodInfos)
+            {
+                typeQueue.Enqueue(methodInfo.ReturnType);
+                typeQueue.Enqueue(methodInfo.DeclaringType);
+
+                var parameters = methodInfo.GetParameters();
+                for (int i  = 0; i < parameters.Length; ++i)
+                {
+                    typeQueue.Enqueue(parameters[i].ParameterType);
+                }
             }
 
             var allTypes = new HashSet<Type>();
@@ -284,6 +355,56 @@
             }
 
             return assemblyReferenceHandleMap;
+        }
+
+        /// <summary>
+        /// Responsible for taking all the MethodInfos and serializing them as MemberReferenceHandles. The V1 of this only supports static methods that belong to a type (i.e. no free functions), and no have generic
+        /// arguments, or ref/out parameters, or that are psuedo-methods (i.e. events, etc.)
+        /// </summary>
+        /// <param name="metadataBuilder"></param>
+        /// <param name="uniqueTypeRefMap"></param>
+        /// <param name="methodDictTokenMap"></param>
+        /// <returns></returns>
+        private static Dictionary<MethodInfo, ValueTuple<MemberReferenceHandle, int>> AccumulateMemberReferenceHandles(MetadataBuilder metadataBuilder, Dictionary<Type, TypeReferenceHandle> uniqueTypeRefMap, Dictionary<MethodInfo, int> methodDictTokenMap)
+        {
+            var dict = new Dictionary<MethodInfo, ValueTuple<MemberReferenceHandle, int>>(methodDictTokenMap.Count);
+            var voidType = typeof(void);
+
+            foreach (var entry in methodDictTokenMap)
+            {
+                var methodInfo = entry.Key;
+                var returnType = methodInfo.ReturnType;
+                var parameters = methodInfo.GetParameters();
+
+                var builder = new BlobBuilder();
+
+                new BlobEncoder(builder).
+                MethodSignature().
+                Parameters(parameters.Length,
+                    returnTypeEncoder =>
+                    {
+                        if (returnType == voidType)
+                        {
+                            returnTypeEncoder.Void();
+                        }
+                        else
+                        {
+                            returnTypeEncoder.Type(isByRef: false).Type(uniqueTypeRefMap[returnType], returnType.IsValueType);
+                        }
+                    },
+                    parametersEncoder =>
+                    {
+                        for (int i = 0; i < parameters.Length; ++i)
+                        {
+                            var parameterType = parameters[i].ParameterType;
+                            parametersEncoder.AddParameter().Type(isByRef: false).Type(uniqueTypeRefMap[parameterType], parameterType.IsValueType);
+                        }
+                    });
+
+                dict.Add(methodInfo, new ValueTuple<MemberReferenceHandle, int>(metadataBuilder.AddMemberReference(uniqueTypeRefMap[methodInfo.DeclaringType], metadataBuilder.GetOrAddString(methodInfo.Name), metadataBuilder.GetOrAddBlob(builder)), entry.Value));
+            }
+
+            return dict;
         }
 
         /// <summary>
@@ -523,8 +644,10 @@
         /// <param name="methodName">the name of the method</param>
         /// <param name="typeTokenMap">the type to token place holder map</param>
         /// <param name="typeToTypeSpecMap">the type to typespec map</param>
+        /// <param name="methodDictTokenMap">method dict token map</param>
+        /// <param name="memberReferenceHandleMap">member reference handle map</param>
         /// <param name="privateKeyOpt">optional key</param>
-        private static void SerializeCompanionAssembly(MetadataBuilder metadataBuilder, string outputAssemblyFilePath, string outputNamespace, string typeName, string methodName, Dictionary<Type, int> typeTokenMap, Dictionary<Type, TypeSpecificationHandle> typeToTypeSpecMap, byte[] privateKeyOpt)
+        private static void SerializeCompanionAssembly(MetadataBuilder metadataBuilder, string outputAssemblyFilePath, string outputNamespace, string typeName, string methodName, Dictionary<Type, int> typeTokenMap, Dictionary<Type, TypeSpecificationHandle> typeToTypeSpecMap, Dictionary<MethodInfo, ValueTuple<MemberReferenceHandle, int>> memberReferenceHandleMap, byte[] privateKeyOpt)
         {
             var netstandardAssemblyRef = metadataBuilder.AddAssemblyReference(metadataBuilder.GetOrAddString("netstandard"), new Version(2, 0, 0, 0), default, metadataBuilder.GetOrAddBlob(new byte[] { 0xCC, 0x7B, 0x13, 0xFF, 0xCD, 0x2D, 0xDD, 0x51 }), default, default);
             var systemObjectTypeRef = metadataBuilder.AddTypeReference(netstandardAssemblyRef, metadataBuilder.GetOrAddString("System"), metadataBuilder.GetOrAddString("Object"));
@@ -542,6 +665,11 @@
                 metadataBuilder.GetOrAddString("System"),
                 metadataBuilder.GetOrAddString("RuntimeTypeHandle"));
 
+            var intptrTypeHandleRef = metadataBuilder.AddTypeReference(
+                netstandardAssemblyRef,
+                metadataBuilder.GetOrAddString("System"),
+                metadataBuilder.GetOrAddString("IntPtr"));
+
             var deserializerRef = metadataBuilder.AddTypeReference(
                 frozenObjectSerializerAssemblyRef,
                 metadataBuilder.GetOrAddString("Microsoft.FrozenObjects"),
@@ -553,11 +681,12 @@
 
             new BlobEncoder(frozenObjectDeserializerSignature).
                 MethodSignature().
-                Parameters(2,
+                Parameters(3,
                     returnType => returnType.Type().Object(),
                     parameters =>
                     {
                         parameters.AddParameter().Type().SZArray().Type(runtimeTypeHandleObjectRef, true);
+                        parameters.AddParameter().Type().SZArray().IntPtr();
                         parameters.AddParameter().Type().String();
                     });
 
@@ -578,7 +707,7 @@
             var codeBuilder = new BlobBuilder();
 
             var il = new InstructionEncoder(codeBuilder);
-            il.LoadConstantI4(typeTokenMap.Count);
+            il.LoadConstantI4(typeTokenMap.Count + 1); // + 1 because we may or may not add a custom method type
             il.OpCode(ILOpCode.Newarr);
             il.Token(runtimeTypeHandleObjectRef);
 
@@ -590,6 +719,19 @@
                 il.Token(typeToTypeSpecMap[entry.Key]);
                 il.OpCode(ILOpCode.Stelem);
                 il.Token(runtimeTypeHandleObjectRef);
+            }
+
+            il.LoadConstantI4(memberReferenceHandleMap.Count);
+            il.OpCode(ILOpCode.Newarr);
+            il.Token(intptrTypeHandleRef);
+
+            foreach (var entry in memberReferenceHandleMap)
+            {
+                il.OpCode(ILOpCode.Dup);
+                il.LoadConstantI4(entry.Value.Item2);
+                il.OpCode(ILOpCode.Ldftn);
+                il.Token(entry.Value.Item1);
+                il.OpCode(ILOpCode.Stelem_i);
             }
 
             il.LoadArgument(0);

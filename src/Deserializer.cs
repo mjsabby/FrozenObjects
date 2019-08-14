@@ -7,7 +7,7 @@
 
     public static unsafe class Deserializer
     {
-        public static object Deserialize(RuntimeTypeHandle[] runtimeTypeHandles, string blobPath)
+        public static object Deserialize(RuntimeTypeHandle[] runtimeTypeHandles, IntPtr[] methodPointers, string blobPath)
         {
             var extraSpace = IntPtr.Size + IntPtr.Size; // 1 extra IntPtr for segmentHandle and the other for size of the allocation (needed on Linux)
             var length = 0L;
@@ -37,7 +37,7 @@
                 }
             }
 
-            var retVal = DeserializeInner(runtimeTypeHandles, buffer, length);
+            var retVal = DeserializeInner(runtimeTypeHandles, methodPointers, buffer, length);
 
             // -InPtr.Size - IntPtr.Size is for size (we need it in Linux)
             Marshal.WriteIntPtr((IntPtr)buffer, 0 - IntPtr.Size - IntPtr.Size, (IntPtr)(length + extraSpace));
@@ -72,13 +72,41 @@
         }
 
         [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
-        private static object DeserializeInner(RuntimeTypeHandle[] runtimeTypeHandles, byte* buffer, long length)
+        private static object DeserializeInner(RuntimeTypeHandle[] runtimeTypeHandles, IntPtr[] methodPointers, byte* buffer, long length)
         {
             byte* objectId = buffer + IntPtr.Size;
 
             while (objectId < buffer + length)
             {
-                IntPtr typeHandle = IntPtr.Size == 8 ? runtimeTypeHandles[(int)*(long*)objectId].Value : runtimeTypeHandles[*(int*)objectId].Value;
+                int index = IntPtr.Size == 8 ? (int)*(long*)objectId : *(int*)objectId;
+
+                // handle types
+                if (index == 0)
+                {
+                    if (IntPtr.Size == 8)
+                    {
+                        *(long*)(objectId + (IntPtr.Size * 3)) = (long)runtimeTypeHandles[0].Value;
+                    }
+                    else
+                    {
+                        *(int*)(objectId + (IntPtr.Size * 3)) = (int)runtimeTypeHandles[0].Value;
+                    }
+                }
+
+                // handle methods
+                if (index == 1)
+                {
+                    if (IntPtr.Size == 8)
+                    {
+                        *(long*)(objectId + IntPtr.Size) = (long)methodPointers[(int)*(long*)(objectId + IntPtr.Size)];
+                    }
+                    else
+                    {
+                        *(int*)(objectId + IntPtr.Size) = (int)methodPointers[*(int*)(objectId + IntPtr.Size)];
+                    }
+                }
+
+                IntPtr typeHandle = runtimeTypeHandles[index].Value;
                 bool isArray = ((long)typeHandle & 0x2) == 0x2;
 
                 var mt = (MethodTable*)typeHandle;
